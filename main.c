@@ -169,6 +169,10 @@ static void read_pty(void)
 {
 	static char buf[65536];
 	size_t total = 0;
+	/* Cursor-only output (arrow keys in a shell or editor: ESC[D, \b, \r)
+	 * changes no cells, so term.c doesn't flag it; redraw for it anyway,
+	 * without clearing the selection like a content change does. */
+	int old_cx = G.t->cx, old_cy = G.t->cy;
 	while (total < (1 << 20)) {
 		ssize_t n = read(G.fd, buf, sizeof buf);
 		if (n > 0) {
@@ -206,6 +210,8 @@ static void read_pty(void)
 		G.dirty = true;
 		G.t->dirty = false;
 	}
+	if (G.t->cx != old_cx || G.t->cy != old_cy)
+		G.dirty = true;
 	SDL_SignalSemaphore(G.sem);
 }
 
