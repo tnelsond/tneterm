@@ -1,4 +1,4 @@
-/* tnelterm: a small terminal emulator with proper complex-script (Khmer)
+/* tneterm: a small terminal emulator with proper complex-script (Khmer)
  * rendering.
  *
  * Layout model ("elastic grid"): the terminal keeps a normal cell grid so
@@ -1036,7 +1036,7 @@ static void set_font_size(float size)
 	if (!load_fonts(size)) {
 		font_done();
 		if (!load_fonts(G.size)) {
-			fprintf(stderr, "tnelterm: could not reload fonts\n");
+			fprintf(stderr, "tneterm: could not reload fonts\n");
 			exit(1);
 		}
 		return;
@@ -1475,7 +1475,7 @@ static void on_text(const char *in)
 static void usage(void)
 {
 	fprintf(stderr,
-	        "usage: tnelterm [-f font] [-k khmer-font] [-K scale] [-s size] [-l px] [-e command args...]\n"
+	        "usage: tneterm [-f font] [-k khmer-font] [-K scale] [-s size] [-l px] [-e command args...]\n"
 	        "  -f  monospace font pattern (default: Terminus,monospace)\n"
 	        "  -k  Khmer font family (default: Noto Sans Khmer)\n"
 	        "  -K  Khmer size relative to the main font (default: auto-match)\n"
@@ -1520,12 +1520,12 @@ int main(int argc, char **argv)
 	signal(SIGPIPE, SIG_IGN);
 
 	SDL_SetHint(SDL_HINT_IME_IMPLEMENTED_UI, "composition");
-	SDL_SetHint(SDL_HINT_APP_ID, "tnelterm");
+	SDL_SetHint(SDL_HINT_APP_ID, "tneterm");
 	if (!SDL_Init(SDL_INIT_VIDEO)) {
 		fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
 		return 1;
 	}
-	G.win = SDL_CreateWindow("tnelterm", 800, 500,
+	G.win = SDL_CreateWindow("tneterm", 800, 500,
 	                         SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN);
 	if (!G.win) {
 		fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
@@ -1564,9 +1564,9 @@ int main(int argc, char **argv)
 	ensure_buffers();
 	spawn(cmd, cols, rows);
 
-	G.dump_path = getenv("TNELTERM_DUMP");
+	G.dump_path = getenv("TNETERM_DUMP");
 	if (G.dump_path) {
-		const char *ms = getenv("TNELTERM_DUMP_MS");
+		const char *ms = getenv("TNETERM_DUMP_MS");
 		G.dump_at = SDL_GetTicks() + (Uint64)(ms ? atoi(ms) : 1000);
 	}
 

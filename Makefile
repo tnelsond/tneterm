@@ -6,15 +6,15 @@ PREFIX ?= /usr/local
 
 OBJS = main.o term.o font.o
 
-tnelterm: $(OBJS)
+tneterm: $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 $(OBJS): term.h font.h
 
-install: tnelterm
-	install -Dm755 tnelterm $(DESTDIR)$(PREFIX)/bin/tnelterm
+install: tneterm
+	install -Dm755 tneterm $(DESTDIR)$(PREFIX)/bin/tneterm
 
 clean:
-	rm -f tnelterm $(OBJS)
+	rm -f tneterm $(OBJS)
 
 .PHONY: install clean

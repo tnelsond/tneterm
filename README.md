@@ -1,4 +1,4 @@
-# tnelterm
+# tneterm
 
 A small SDL3 terminal emulator that renders Khmer (and other complex scripts)
 properly: text is shaped with HarfBuzz and drawn at its natural width instead
@@ -9,8 +9,8 @@ of being squeezed into monospace cells.
 Needs SDL3, HarfBuzz, FreeType, fontconfig.
 
     make
-    ./tnelterm                      # runs $SHELL
-    ./tnelterm -s 14 -k "Khmer OS System" -e vim file.txt
+    ./tneterm                      # runs $SHELL
+    ./tneterm -s 14 -k "Khmer OS System" -e vim file.txt
 
 Options: `-f` monospace font pattern (default `Terminus,monospace`; bitmap
 fonts are drawn pixel-exact at their nearest native size), `-k` Khmer font
@@ -66,5 +66,5 @@ ligatures for Latin text, config file.
 
 ## Testing aid
 
-`TNELTERM_DUMP=out.png TNELTERM_DUMP_MS=1500 ./tnelterm -e ...` saves a
+`TNETERM_DUMP=out.png TNETERM_DUMP_MS=1500 ./tneterm -e ...` saves a
 screenshot after the given delay and exits.

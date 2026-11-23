@@ -499,14 +499,14 @@ bool font_init(const char *mono, const char *khmer, float px, float kscale, int 
 	char mpat[512];
 	snprintf(mpat, sizeof mpat, "%s:pixelsize=%g", mono, (double)px);
 	if (fc_load(mpat, 0) != 0) {
-		fprintf(stderr, "tnelterm: no font found for '%s'\n", mono);
+		fprintf(stderr, "tneterm: no font found for '%s'\n", mono);
 		return false;
 	}
 	char kpat[256];
 	snprintf(kpat, sizeof kpat, "%s:lang=km", khmer);
 	khmer_font = fc_load(kpat, 0x1780);
 	if (khmer_font < 0)
-		fprintf(stderr, "tnelterm: warning: no Khmer font found\n");
+		fprintf(stderr, "tneterm: warning: no Khmer font found\n");
 
 	FT_Face pf = fonts[0].face;
 	float asc = pf->size->metrics.ascender / 64.0f;
