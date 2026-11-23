@@ -48,10 +48,22 @@ static Cell blank(const Term *t)
 	return c;
 }
 
+static inline bool cell_is_default(const Cell *c)
+{
+	return !c->cp && !c->fg && !c->bg && !c->attr && !c->ncomb;
+}
+
 static void line_clear(Line *l, int x0, int x1, Cell b)
 {
 	x0 = imax(x0, 0);
 	x1 = imin(x1, l->cols);
+	if (x1 <= x0)
+		return;
+	if (cell_is_default(&b)) {
+		/* the common case: default colours, so all-zero bytes */
+		memset(&l->c[x0], 0, (size_t)(x1 - x0) * sizeof(Cell));
+		return;
+	}
 	for (int i = x0; i < x1; i++)
 		l->c[i] = b;
 }
@@ -94,20 +106,31 @@ static void fix_wide(Line *l, int x, Cell b)
 
 /* ---- scrollback ---- */
 
-static void sb_push(Term *t, Line *l)
+/* Copy `src` into the scrollback, dropping trailing default cells (readers
+ * treat cells past l->cols as blank). Most lines are much shorter than the
+ * screen, so this saves both memory and bandwidth. The caller keeps `src`. */
+static void sb_store(Term *t, const Line *src)
 {
-	if (t->sb_cap == 0) {
-		free(l);
+	if (t->sb_cap == 0)
 		return;
-	}
+	int n = src->cols;
+	while (n > 0 && cell_is_default(&src->c[n - 1]))
+		n--;
+	size_t sz = sizeof(Line) + (size_t)n * sizeof(Cell);
+	Line *l;
 	if (t->sb_count < t->sb_cap) {
+		l = malloc(sz);
 		t->sb[(t->sb_head + t->sb_count) % t->sb_cap] = l;
 		t->sb_count++;
 	} else {
-		free(t->sb[t->sb_head]);
+		/* full: recycle the oldest line's allocation */
+		l = realloc(t->sb[t->sb_head], sz);
 		t->sb[t->sb_head] = l;
 		t->sb_head = (t->sb_head + 1) % t->sb_cap;
 	}
+	l->cols = n;
+	l->wrapped = src->wrapped;
+	memcpy(l->c, src->c, (size_t)n * sizeof(Cell));
 	t->sb_added++;
 }
 
@@ -146,13 +169,10 @@ static void scroll_up(Term *t, int top, int bot, int n, bool to_sb)
 	Cell b = blank(t);
 	for (int i = 0; i < n; i++) {
 		Line *l = t->lines[top];
-		if (to_sb && top == 0 && !t->altscreen && t->sb_cap) {
-			sb_push(t, l);
-			l = line_new(t->cols, b);
-		} else {
-			line_clear(l, 0, l->cols, b);
-			l->wrapped = false;
-		}
+		if (to_sb && top == 0 && !t->altscreen)
+			sb_store(t, l);
+		line_clear(l, 0, l->cols, b);
+		l->wrapped = false;
 		memmove(&t->lines[top], &t->lines[top + 1], (size_t)(bot - top) * sizeof(Line *));
 		t->lines[bot] = l;
 	}
@@ -346,7 +366,7 @@ static void tputc(Term *t, uint32_t cp)
 	if (t->charsets[t->gl] == '0' && cp >= 0x5f && cp <= 0x7e)
 		cp = acs[cp - 0x5f];
 
-	int w = wcwidth((wchar_t)cp);
+	int w = cp >= 0x20 && cp < 0x7f ? 1 : wcwidth((wchar_t)cp);
 	if (w == 0) {
 		put_combining(t, cp);
 		return;
@@ -373,10 +393,12 @@ static void tputc(Term *t, uint32_t cp)
 		insert_blank(t, w);
 
 	Line *l = t->lines[t->cy];
-	Cell b = blank(t);
-	fix_wide(l, t->cx, b);
-	if (w == 2)
-		fix_wide(l, t->cx + 1, b);
+	if (((l->c[t->cx].attr | (w == 2 ? l->c[t->cx + 1].attr : 0)) & (ATTR_WIDE | ATTR_WDUMMY))) {
+		Cell b = blank(t);
+		fix_wide(l, t->cx, b);
+		if (w == 2)
+			fix_wide(l, t->cx + 1, b);
+	}
 
 	Cell *c = &l->c[t->cx];
 	*c = t->pen;
@@ -950,9 +972,8 @@ static void resize_screen(Term *t, Line ***plines, int oldrows, int cols, int ro
 		int shift = imax(0, *cy - (rows - 1));
 		for (int i = 0; i < shift; i++) {
 			if (is_main)
-				sb_push(t, lines[i]);
-			else
-				free(lines[i]);
+				sb_store(t, lines[i]);
+			free(lines[i]);
 		}
 		for (int i = shift + rows; i < oldrows; i++)
 			free(lines[i]);

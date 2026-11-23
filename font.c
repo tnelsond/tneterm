@@ -45,6 +45,70 @@ typedef struct {
 static GSlot *gtab;
 static size_t gcap, gcount;
 
+/* ---- atlas: shelf-packed pages ---- */
+
+#define PAGE 1024
+#define MAXPAGES 16
+static SDL_Texture *pages[MAXPAGES];
+static int npages, shelf_x, shelf_y, shelf_h;
+
+static bool new_page(SDL_Renderer *ren)
+{
+	if (npages == MAXPAGES)
+		return false;
+	SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC,
+	                                   PAGE, PAGE);
+	if (!t)
+		return false;
+	SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+	/* Glyphs are drawn 1:1 at whole pixels, where linear sampling is
+	 * exact; it only smooths scaled colour emoji. 1px gaps stop bleed. */
+	SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+	uint8_t *zero = calloc(PAGE * PAGE, 4);
+	if (npages == 0) /* 4x4 white block at the origin for solid fills */
+		for (int y = 0; y < 4; y++)
+			memset(zero + (size_t)y * PAGE * 4, 0xff, 4 * 4);
+	SDL_UpdateTexture(t, NULL, zero, PAGE * 4);
+	free(zero);
+	pages[npages++] = t;
+	shelf_x = npages == 1 ? 6 : 1;
+	shelf_y = 1;
+	shelf_h = npages == 1 ? 5 : 0;
+	return true;
+}
+
+/* Reserve a w*h slot; returns the page or NULL if the atlas is full. */
+static SDL_Texture *atlas_alloc(SDL_Renderer *ren, int w, int h, int *x, int *y)
+{
+	if (w + 2 > PAGE || h + 2 > PAGE)
+		return NULL;
+	if (!npages && !new_page(ren))
+		return NULL;
+	if (shelf_x + w + 1 > PAGE) {
+		shelf_y += shelf_h + 1;
+		shelf_x = 1;
+		shelf_h = 0;
+	}
+	if (shelf_y + h + 1 > PAGE) {
+		if (!new_page(ren))
+			return NULL;
+	}
+	*x = shelf_x;
+	*y = shelf_y;
+	shelf_x += w + 1;
+	if (h > shelf_h)
+		shelf_h = h;
+	return pages[npages - 1];
+}
+
+SDL_Texture *font_white(SDL_Renderer *ren, float *u, float *v)
+{
+	if (!npages && !new_page(ren))
+		return NULL;
+	*u = *v = 2.0f / PAGE;
+	return pages[0];
+}
+
 static bool is_khmer(uint32_t cp)
 {
 	return (cp >= 0x1780 && cp <= 0x17ff) || (cp >= 0x19e0 && cp <= 0x19ff);
@@ -227,6 +291,8 @@ static void render_glyph(SDL_Renderer *ren, Font *f, uint32_t gid, bool bold, Gl
 		return;
 
 	uint8_t *px = malloc((size_t)g->w * g->h * 4);
+	if (!px)
+		return;
 	int pitch = abs(b->pitch);
 	for (int y = 0; y < g->h; y++) {
 		const uint8_t *row = b->buffer + (size_t)y * pitch;
@@ -245,10 +311,18 @@ static void render_glyph(SDL_Renderer *ren, Font *f, uint32_t gid, bool bold, Gl
 				o[0] = o[1] = o[2] = 255;
 				o[3] = (row[x >> 3] >> (7 - (x & 7)) & 1) ? 255 : 0;
 				break;
-			case FT_PIXEL_MODE_BGRA:
-				memcpy(o, row + x * 4, 4);
+			case FT_PIXEL_MODE_BGRA: {
+				/* premultiplied BGRA -> straight RGBA, so colour glyphs
+				 * share the atlas and its blend mode */
+				const uint8_t *i = row + x * 4;
+				uint8_t a = i[3];
+				o[0] = a ? (uint8_t)SDL_min(255, i[2] * 255 / a) : 0;
+				o[1] = a ? (uint8_t)SDL_min(255, i[1] * 255 / a) : 0;
+				o[2] = a ? (uint8_t)SDL_min(255, i[0] * 255 / a) : 0;
+				o[3] = a;
 				g->color = true;
 				break;
+			}
 			default:
 				memset(o, 0, 4);
 				break;
@@ -261,14 +335,15 @@ static void render_glyph(SDL_Renderer *ren, Font *f, uint32_t gid, bool bold, Gl
 					o[x * 4 + 3] = o[(x - 1) * 4 + 3];
 		}
 	}
-	g->tex = SDL_CreateTexture(ren, g->color ? SDL_PIXELFORMAT_BGRA32 : SDL_PIXELFORMAT_RGBA32,
-	                           SDL_TEXTUREACCESS_STATIC, g->w, g->h);
+	int ax, ay;
+	g->tex = atlas_alloc(ren, g->w, g->h, &ax, &ay);
 	if (g->tex) {
-		SDL_UpdateTexture(g->tex, NULL, px, g->w * 4);
-		SDL_SetTextureBlendMode(g->tex, g->color ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
-		                                         : SDL_BLENDMODE_BLEND);
-		if (!f->bitmap)
-			SDL_SetTextureScaleMode(g->tex, SDL_SCALEMODE_NEAREST);
+		SDL_Rect r = { ax, ay, g->w, g->h };
+		SDL_UpdateTexture(g->tex, &r, px, g->w * 4);
+		g->u0 = (float)ax / PAGE;
+		g->v0 = (float)ay / PAGE;
+		g->u1 = (float)(ax + g->w) / PAGE;
+		g->v1 = (float)(ay + g->h) / PAGE;
 	}
 	free(px);
 }
@@ -391,9 +466,9 @@ static void scale_khmer(float px, float kscale)
 
 void font_done(void)
 {
-	for (size_t i = 0; i < gcap; i++)
-		if (gtab[i].used && gtab[i].g.tex)
-			SDL_DestroyTexture(gtab[i].g.tex);
+	for (int i = 0; i < npages; i++)
+		SDL_DestroyTexture(pages[i]);
+	npages = 0;
 	free(gtab);
 	gtab = NULL;
 	gcap = gcount = 0;
@@ -412,7 +487,7 @@ void font_done(void)
 	ftlib = NULL;
 }
 
-bool font_init(const char *mono, const char *khmer, float px, float kscale)
+bool font_init(const char *mono, const char *khmer, float px, float kscale, int spacing)
 {
 	if (FT_Init_FreeType(&ftlib) || !FcInit())
 		return false;
@@ -443,13 +518,20 @@ bool font_init(const char *mono, const char *khmer, float px, float kscale)
 
 	if (khmer_font > 0) {
 		scale_khmer(px, kscale);
+		/* Size lines for everyday Khmer: above-vowels, subscripts and a
+		 * vowel under a subscript (ខ្ញុំ, កម្ពុជា). Only rare stacked marks
+		 * like ក៉ី / ញ៉ុំ overhang into the line above; the renderer draws all
+		 * backgrounds before any text so the overhang stays visible. */
 		float top = 0, bot = 0;
-		measure_ink(khmer_font, "ក្សៀ ស្ត្រី ញ៉ុំ ឡើង ផ្ទុំ ម្ល៉ឹង ឆ្ងាញ់ ទ្រព្យ", &top, &bot);
+		measure_ink(khmer_font, "កី ក្ក ស្ត្រី ឡើង ថ្ងៃ ប្រទេស ឆ្ងាញ់ ខ្ញុំ កម្ពុជា", &top, &bot);
 		if (top > asc) asc = top;
 		if (-bot > desc) desc = -bot;
 	}
-	fm.ascent = (int)ceilf(asc);
-	fm.ch = fm.ascent + (int)ceilf(desc);
+	/* extra line spacing goes half above, half below the text */
+	fm.ascent = (int)ceilf(asc) + spacing / 2;
+	fm.ch = SDL_max(1, (int)ceilf(asc) + (int)ceilf(desc) + spacing);
+	if (fm.ascent < 1)
+		fm.ascent = 1;
 	fm.thick = px / 14 > 1 ? (int)lroundf(px / 14) : 1;
 	fm.uline = (int)lroundf(-pf->underline_position * pf->size->metrics.y_scale / 65536.0f / 64.0f);
 	/* Sit underlines low enough to clear Khmer subscripts. */

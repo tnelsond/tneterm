@@ -79,6 +79,7 @@ static struct {
 	/* font settings, kept for zooming */
 	const char *mono, *khmer;
 	float size, base_size, kscale, ui_scale;
+	int spacing;
 } G;
 
 /* ---- pty ---- */
@@ -255,6 +256,76 @@ static DItem *push_item(void)
 	return &G.items[G.nitems++];
 }
 
+/* ---- shaping cache ----
+ * HarfBuzz shaping is the most expensive part of a frame, and the same runs
+ * are shaped again every frame. Cache results keyed by font + codepoints +
+ * cluster offsets (relative to the run start). Direct-mapped, so a miss just
+ * replaces the slot. */
+
+#define SHAPE_SLOTS 1024
+
+typedef struct {
+	uint64_t hash;
+	int font, n, ng;
+	uint32_t *cps, *cls; /* cls relative to the run's first column */
+	ShapedGlyph *sg;     /* the allocation; cps and cls point into it */
+} ShapeEntry;
+
+static ShapeEntry shape_cache[SHAPE_SLOTS];
+
+static void shape_cache_clear(void)
+{
+	for (int i = 0; i < SHAPE_SLOTS; i++) {
+		free(shape_cache[i].sg); /* owns cps and cls too */
+		shape_cache[i] = (ShapeEntry){ 0 };
+	}
+}
+
+/* Shape G.cps/G.cls[0..n) (clusters are absolute columns >= base) into G.sg. */
+static int shape_cached(int font, int n, uint32_t base)
+{
+	uint64_t h = 1469598103934665603ULL ^ (uint64_t)font;
+	for (int i = 0; i < n; i++) {
+		h = (h ^ G.cps[i]) * 1099511628211ULL;
+		h = (h ^ (G.cls[i] - base)) * 1099511628211ULL;
+	}
+	ShapeEntry *e = &shape_cache[h % SHAPE_SLOTS];
+	if (e->cps && e->hash == h && e->font == font && e->n == n) {
+		bool same = true;
+		for (int i = 0; i < n && same; i++)
+			same = e->cps[i] == G.cps[i] && e->cls[i] == G.cls[i] - base;
+		if (same) {
+			for (int i = 0; i < e->ng; i++) {
+				G.sg[i] = e->sg[i];
+				G.sg[i].cluster += base;
+			}
+			return e->ng;
+		}
+	}
+	int ng = font_shape(font, G.cps, G.cls, n, G.sg, G.scratch_cap);
+	/* one allocation holds cps, cls and the glyphs */
+	void *mem = malloc((size_t)n * 2 * sizeof(uint32_t) + (size_t)ng * sizeof(ShapedGlyph));
+	if (!mem)
+		return ng;
+	free(e->sg);
+	e->hash = h;
+	e->font = font;
+	e->n = n;
+	e->ng = ng;
+	e->sg = mem;
+	e->cps = (uint32_t *)(e->sg + ng);
+	e->cls = e->cps + n;
+	for (int i = 0; i < n; i++) {
+		e->cps[i] = G.cps[i];
+		e->cls[i] = G.cls[i] - base;
+	}
+	for (int i = 0; i < ng; i++) {
+		e->sg[i] = G.sg[i];
+		e->sg[i].cluster -= base;
+	}
+	return ng;
+}
+
 static bool is_box(uint32_t cp)
 {
 	return cp >= 0x2500 && cp <= 0x259f;
@@ -353,7 +424,7 @@ static void layout_row(const Line *l, int cols, int *X)
 				G.cls[n++] = (uint32_t)k;
 			}
 		}
-		int ng = font_shape(fnt, G.cps, G.cls, n, G.sg, G.scratch_cap);
+		int ng = shape_cached(fnt, n, (uint32_t)c);
 
 		float x0 = flow ? pen : fmaxf(pen, (float)(c * cw)), x = x0;
 		for (int k = c; k < end; k++)
@@ -390,26 +461,112 @@ static void layout_row(const Line *l, int cols, int *X)
 
 /* ---- drawing ---- */
 
+/* Everything is queued as textured quads and drawn with one
+ * SDL_RenderGeometry call per layer and atlas page: backgrounds first, then
+ * all glyphs, then overlays (box drawing, underlines). Drawing every
+ * background before any text also lets tall Khmer stacks overhang into the
+ * neighbouring line without being painted over. */
+typedef struct {
+	SDL_Texture *tex;
+	SDL_Vertex *v;
+	int *idx;
+	int nv, cap;
+} Batch;
+
+enum { L_BG, L_OVER, L_TEXT }; /* L_TEXT + n: glyphs on atlas page n */
+#define MAXBATCH 18
+
+static struct {
+	Batch b[MAXBATCH];
+	int nb, layer;
+	SDL_FColor col;
+	SDL_Texture *white;
+	float wu, wv;
+} R;
+
+static Batch *batch_for(SDL_Texture *tex, int layer)
+{
+	if (layer != L_TEXT)
+		return &R.b[layer];
+	for (int i = L_TEXT; i < R.nb; i++)
+		if (R.b[i].tex == tex)
+			return &R.b[i];
+	if (R.nb == MAXBATCH)
+		return NULL;
+	Batch *b = &R.b[R.nb++];
+	b->tex = tex;
+	b->nv = 0;
+	return b;
+}
+
+static void quad(Batch *b, float x0, float y0, float x1, float y1,
+                 float u0, float v0, float u1, float v1, SDL_FColor c)
+{
+	if (b->nv + 4 > b->cap) {
+		b->cap = b->cap ? b->cap * 2 : 4096;
+		b->v = realloc(b->v, (size_t)b->cap * sizeof *b->v);
+		b->idx = realloc(b->idx, (size_t)b->cap / 4 * 6 * sizeof *b->idx);
+	}
+	SDL_Vertex *v = &b->v[b->nv];
+	v[0] = (SDL_Vertex){ { x0, y0 }, c, { u0, v0 } };
+	v[1] = (SDL_Vertex){ { x1, y0 }, c, { u1, v0 } };
+	v[2] = (SDL_Vertex){ { x1, y1 }, c, { u1, v1 } };
+	v[3] = (SDL_Vertex){ { x0, y1 }, c, { u0, v1 } };
+	int *ix = &b->idx[b->nv / 4 * 6], n = b->nv;
+	ix[0] = n; ix[1] = n + 1; ix[2] = n + 2;
+	ix[3] = n; ix[4] = n + 2; ix[5] = n + 3;
+	b->nv += 4;
+}
+
+static void batch_begin(void)
+{
+	R.white = font_white(G.ren, &R.wu, &R.wv);
+	R.b[L_BG].tex = R.b[L_OVER].tex = R.white;
+	R.b[L_BG].nv = R.b[L_OVER].nv = 0;
+	R.nb = L_TEXT;
+	R.layer = L_BG;
+}
+
+static void batch_draw(Batch *b)
+{
+	if (b->nv && b->tex)
+		SDL_RenderGeometry(G.ren, b->tex, b->v, b->nv, b->idx, b->nv / 4 * 6);
+	b->nv = 0;
+}
+
+static void batch_flush(void)
+{
+	batch_draw(&R.b[L_BG]);
+	for (int i = L_TEXT; i < R.nb; i++)
+		batch_draw(&R.b[i]);
+	batch_draw(&R.b[L_OVER]);
+	R.nb = L_TEXT;
+}
+
+static SDL_FColor fcolor(uint32_t rgb, Uint8 a)
+{
+	return (SDL_FColor){ (rgb >> 16 & 0xff) / 255.0f, (rgb >> 8 & 0xff) / 255.0f,
+	                     (rgb & 0xff) / 255.0f, a / 255.0f };
+}
+
 static void set_color(uint32_t rgb, Uint8 a)
 {
-	SDL_SetRenderDrawColor(G.ren, rgb >> 16 & 0xff, rgb >> 8 & 0xff, rgb & 0xff, a);
+	R.col = fcolor(rgb, a);
 }
 
-static void fill(int x, int y, int w, int h, uint32_t rgb)
-{
-	if (w <= 0 || h <= 0)
-		return;
-	set_color(rgb, 255);
-	SDL_FRect r = { (float)x, (float)y, (float)w, (float)h };
-	SDL_RenderFillRect(G.ren, &r);
-}
-
+/* solid rectangle in the current colour and layer */
 static void rect(int x, int y, int w, int h)
 {
 	if (w <= 0 || h <= 0)
 		return;
-	SDL_FRect r = { (float)x, (float)y, (float)w, (float)h };
-	SDL_RenderFillRect(G.ren, &r);
+	quad(&R.b[R.layer], (float)x, (float)y, (float)(x + w), (float)(y + h),
+	     R.wu, R.wv, R.wu, R.wv, R.col);
+}
+
+static void fill(int x, int y, int w, int h, uint32_t rgb)
+{
+	set_color(rgb, 255);
+	rect(x, y, w, h);
 }
 
 #define B(l, r, u, d) ((l) | (r) << 2 | (u) << 4 | (d) << 6)
@@ -524,15 +681,13 @@ static void draw_glyph(int font, uint32_t gid, bool bold, float x, float baselin
 	const Glyph *g = font_glyph(G.ren, font, gid, bold);
 	if (!g->tex)
 		return;
+	Batch *b = batch_for(g->tex, L_TEXT);
+	if (!b)
+		return;
 	float s = g->scale;
-	SDL_FRect r = {
-		roundf(x + g->left * s), roundf(baseline - g->top * s), g->w * s, g->h * s
-	};
-	if (g->color)
-		SDL_SetTextureColorMod(g->tex, 255, 255, 255);
-	else
-		SDL_SetTextureColorMod(g->tex, rgb >> 16 & 0xff, rgb >> 8 & 0xff, rgb & 0xff);
-	SDL_RenderTexture(G.ren, g->tex, NULL, &r);
+	float x0 = roundf(x + g->left * s), y0 = roundf(baseline - g->top * s);
+	quad(b, x0, y0, x0 + g->w * s, y0 + g->h * s, g->u0, g->v0, g->u1, g->v1,
+	     g->color ? (SDL_FColor){ 1, 1, 1, 1 } : fcolor(rgb, 255));
 }
 
 static uint32_t resolve(uint32_t col, bool fg, uint16_t attr)
@@ -631,11 +786,17 @@ static void render_row(int row, const Line *l, int y)
 	}
 
 	int ox = G.pad;
-	for (int c = 0; c < cols; c++) {
-		if (block && c >= lo && c < hi)
+	for (int c = 0; c < cols;) {
+		if ((block && c >= lo && c < hi) || bgc[c] == term_default_bg) {
+			c++;
 			continue;
-		if (bgc[c] != term_default_bg)
-			fill(ox + X[c], y, X[c + 1] - X[c], fm.ch, bgc[c]);
+		}
+		/* one quad per run of equal background */
+		int e = c + 1;
+		while (e < cols && bgc[e] == bgc[c] && !(block && e >= lo && e < hi))
+			e++;
+		fill(ox + X[c], y, X[e] - X[c], fm.ch, bgc[c]);
+		c = e;
 	}
 	if (block) {
 		/* fgc/bgc are swapped inside the cursor, so fgc is the cell's bg */
@@ -650,9 +811,10 @@ static void render_row(int row, const Line *l, int y)
 		if (G.preedit[0])
 			;
 		else if (!G.focused) {
-			set_color(cc, 255);
-			SDL_FRect r = { (float)cx0 + 0.5f, (float)y + 0.5f, (float)cw - 1, (float)fm.ch - 1 };
-			SDL_RenderRect(G.ren, &r);
+			fill(cx0, y, cw, 1, cc);
+			fill(cx0, y + fm.ch - 1, cw, 1, cc);
+			fill(cx0, y, 1, fm.ch, cc);
+			fill(cx0 + cw - 1, y, 1, fm.ch, cc);
 		} else if (t->cursor_style <= 4) {
 			fill(cx0, y + fm.ch - 2 * fm.thick, cw, 2 * fm.thick, cc);
 		} else {
@@ -667,7 +829,9 @@ static void render_row(int row, const Line *l, int y)
 		if (it->font < 0) {
 			int x0 = ox + X[it->col];
 			int x1 = ox + (it->col + it->w <= cols ? X[it->col + it->w] : X[cols]);
+			R.layer = L_OVER;
 			draw_box(it->gid, x0, y, x1 - x0, fm.ch, fg);
+			R.layer = L_BG;
 			continue;
 		}
 		float x = ox + it->x;
@@ -681,14 +845,18 @@ static void render_row(int row, const Line *l, int y)
 		draw_glyph(it->font, it->gid, it->bold, x, baseline - it->yoff, fg);
 	}
 
+	R.layer = L_OVER;
 	for (int c = 0; c < cols; c++) {
 		uint16_t a = cell_at(l, c)->attr;
+		if (!(a & (ATTR_UNDERLINE | ATTR_STRIKE)))
+			continue;
 		int x0 = ox + X[c], w = X[c + 1] - X[c];
 		if (a & ATTR_UNDERLINE)
 			fill(x0, y + fm.ascent + fm.uline, w, fm.thick, fgc[c]);
 		if (a & ATTR_STRIKE)
 			fill(x0, y + fm.ascent * 2 / 3, w, fm.thick, fgc[c]);
 	}
+	R.layer = L_BG;
 }
 
 /* Decode UTF-8 into codepoints; returns count. */
@@ -735,7 +903,9 @@ static void render_preedit(void)
 		           (float)(y + fm.ascent) - sg[i].y_off, term_default_fg);
 		pen += sg[i].x_adv;
 	}
+	R.layer = L_OVER;
 	fill(x, y + fm.ascent + fm.uline, (int)ceilf(w), fm.thick, term_default_fg);
+	R.layer = L_BG;
 }
 
 static void ensure_buffers(void)
@@ -766,13 +936,18 @@ static void ensure_buffers(void)
 static void render(void)
 {
 	ensure_buffers();
-	set_color(term_default_bg, 255);
+	uint32_t bg = term_default_bg;
+	SDL_SetRenderDrawColor(G.ren, bg >> 16 & 0xff, bg >> 8 & 0xff, bg & 0xff, 255);
 	SDL_RenderClear(G.ren);
 	G.cur_x = -1;
+	batch_begin();
 	for (int r = 0; r < G.t->rows; r++)
 		render_row(r, term_view_line(G.t, r, G.scroll), G.pad + r * fm.ch);
-	if (G.preedit[0] && G.cur_x >= 0)
-		render_preedit();
+	batch_flush();
+	if (G.preedit[0] && G.cur_x >= 0) {
+		render_preedit(); /* covers the text beneath it */
+		batch_flush();
+	}
 
 	if (G.cur_x >= 0) {
 		SDL_Rect ir = { (int)(G.cur_x / G.density), (int)(G.cur_y / G.density),
@@ -846,7 +1021,8 @@ static void on_resize(void)
 
 static bool load_fonts(float size)
 {
-	return font_init(G.mono, G.khmer, size * G.ui_scale * 96.0f / 72.0f, G.kscale);
+	return font_init(G.mono, G.khmer, size * G.ui_scale * 96.0f / 72.0f, G.kscale,
+	                 (int)lroundf(G.spacing * G.ui_scale));
 }
 
 /* Change the font size, keeping the window size; the grid reflows to fit. */
@@ -856,6 +1032,7 @@ static void set_font_size(float size)
 	if (size == G.size)
 		return;
 	font_done();
+	shape_cache_clear(); /* glyph ids belong to the old fonts */
 	if (!load_fonts(size)) {
 		font_done();
 		if (!load_fonts(G.size)) {
@@ -1298,11 +1475,12 @@ static void on_text(const char *in)
 static void usage(void)
 {
 	fprintf(stderr,
-	        "usage: tnelterm [-f font] [-k khmer-font] [-K scale] [-s size] [-e command args...]\n"
+	        "usage: tnelterm [-f font] [-k khmer-font] [-K scale] [-s size] [-l px] [-e command args...]\n"
 	        "  -f  monospace font pattern (default: Terminus,monospace)\n"
 	        "  -k  Khmer font family (default: Noto Sans Khmer)\n"
 	        "  -K  Khmer size relative to the main font (default: auto-match)\n"
-	        "  -s  font size in points (default: 12)\n");
+	        "  -s  font size in points (default: 12)\n"
+	        "  -l  extra pixels between lines, may be negative (default: 0)\n");
 	exit(1);
 }
 
@@ -1322,6 +1500,8 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "-K") && i + 1 < argc) {
 			kscale = strtof(argv[++i], NULL);
 			if (kscale <= 0) usage();
+		} else if (!strcmp(argv[i], "-l") && i + 1 < argc) {
+			G.spacing = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
 			size = strtof(argv[++i], NULL);
 			if (size <= 0) usage();
